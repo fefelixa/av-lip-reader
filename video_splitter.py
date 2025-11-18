@@ -7,7 +7,7 @@ for filename in os.listdir(DIR):
     print(DIR / filename)
     if filename[-4:] == ".mov":
         try:
-            os.mkdir(DIR/filename[:-4])
+            os.mkdir(DIR / filename[:-4])
         except:
             pass
         # for i in range(20):
