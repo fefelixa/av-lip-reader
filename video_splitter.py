@@ -1,4 +1,4 @@
-import ffmpeg, os
+import os
 import subprocess
 import librosa
 from pathlib import Path
