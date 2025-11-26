@@ -11,19 +11,24 @@ import subprocess
 from pathlib import Path
 
 ROOT_DIR = Path(__file__).resolve().parent
-VIDEO_ROOT = ROOT_DIR / "long_videos"   # 输入 .mov 根目录
-WAV_ROOT = ROOT_DIR / "wav"             # 输出 wav 根目录
+VIDEO_ROOT = ROOT_DIR / "long_videos"  # 输入 .mov 根目录
+WAV_ROOT = ROOT_DIR / "wav"  # 输出 wav 根目录
 
 FFMPEG = "ffmpeg"
+
+
 def mov_to_wav_single(mov_path: Path, wav_path: Path) -> None:
     wav_path.parent.mkdir(parents=True, exist_ok=True)
     cmd = [
         FFMPEG,
-        "-y",              # 自动覆盖
-        "-i", str(mov_path),
-        "-ac", "1",        # 单声道
-        "-ar", "16000",    # 16kHz
-        "-vn",             # 去掉视频
+        "-y",  # 自动覆盖
+        "-i",
+        str(mov_path),
+        "-ac",
+        "1",  # 单声道
+        "-ar",
+        "16000",  # 16kHz
+        "-vn",  # 去掉视频
         str(wav_path),
     ]
     print("[CMD]", " ".join(cmd))

@@ -29,8 +29,8 @@ from sklearn.decomposition import PCA
 
 ROOT_DIR = Path(__file__).resolve().parent
 
-ROI_DIR = ROOT_DIR / "roi_npy"          # video_mouth_roi_extractor.py 输出
-WAV_DIR = ROOT_DIR / "wav"              # 你从 .mov 抽出来的 wav
+ROI_DIR = ROOT_DIR / "roi_npy"  # video_mouth_roi_extractor.py 输出
+WAV_DIR = ROOT_DIR / "wav"  # 你从 .mov 抽出来的 wav
 AUDIO_OUT_DIR = ROOT_DIR / "audio_feats"
 VISUAL_OUT_DIR = ROOT_DIR / "visual_feats"
 MODELS_DIR = ROOT_DIR / "models"
@@ -42,6 +42,7 @@ N_PCA_COMPONENTS = 30
 
 
 # ===================== Audio 特征：MFCC（librosa） =====================
+
 
 def extract_audio_mfcc_librosa(
     wav_path: Path,
@@ -84,6 +85,7 @@ def extract_audio_mfcc_librosa(
 
 # ===================== Visual 形状特征：mouth height / width =====================
 
+
 def mouth_shape_features(roi_frame: np.ndarray) -> np.ndarray:
     """
     从单帧 mouth ROI 提取 shape-based 特征：height、width。
@@ -124,7 +126,10 @@ def mouth_shape_features(roi_frame: np.ndarray) -> np.ndarray:
 
 # ===================== Visual 外观特征：2D DCT 低频 =====================
 
-def dct_lowfreq_features(roi_frame: np.ndarray, num_coeff: int = N_DCT_COEFFS) -> np.ndarray:
+
+def dct_lowfreq_features(
+    roi_frame: np.ndarray, num_coeff: int = N_DCT_COEFFS
+) -> np.ndarray:
     """
     对单帧 ROI 做 2D DCT，并按“从左上到右下”的对角线顺序取前 num_coeff 个系数。
 
@@ -155,6 +160,7 @@ def dct_lowfreq_features(roi_frame: np.ndarray, num_coeff: int = N_DCT_COEFFS) -
 
 
 # ===================== Visual 外观特征：PCA（Eigenlips） =====================
+
 
 def fit_pca_on_roi_dir(
     roi_dir: Path,
@@ -194,7 +200,7 @@ def fit_pca_on_roi_dir(
 
     if pca_model_path is not None:
         pca_model_path.parent.mkdir(parents=True, exist_ok=True)
-        dump(pca, pca_model_path)
+        dump(pca, str(pca_model_path) + '.pca')
         print(f"[INFO] PCA model saved to {pca_model_path}")
 
     return pca
@@ -206,6 +212,7 @@ def load_pca(pca_model_path: Path) -> PCA:
 
 
 # ===================== 主流程：对齐 audio / visual 文件名并输出多种特征 =====================
+
 
 def process_av_features_default() -> None:
     """
@@ -229,7 +236,9 @@ def process_av_features_default() -> None:
     audio_out_dir = AUDIO_OUT_DIR
     visual_out_dir = VISUAL_OUT_DIR
     pca_model_path = PCA_MODEL_PATH
-
+    wav_dir.mkdir(exist_ok=True)
+    roi_dir.mkdir(exist_ok=True)
+    pca_model_path.mkdir(exist_ok=True)
     audio_out_dir.mkdir(parents=True, exist_ok=True)
     visual_out_dir.mkdir(parents=True, exist_ok=True)
     MODELS_DIR.mkdir(parents=True, exist_ok=True)
@@ -264,7 +273,9 @@ def process_av_features_default() -> None:
             audio_feats = extract_audio_mfcc_librosa(wav_path)
             audio_out_path = audio_out_dir / f"{base_id}_audio_mfcc.npy"
             np.save(audio_out_path, audio_feats.astype(np.float32))
-            print(f"[INFO] Saved audio MFCC: {audio_out_path}, shape={audio_feats.shape}")
+            print(
+                f"[INFO] Saved audio MFCC: {audio_out_path}, shape={audio_feats.shape}"
+            )
 
         # ========== Visual 特征 ==========
         roi_seq = np.load(roi_path)  # (T, H, W)
@@ -285,14 +296,16 @@ def process_av_features_default() -> None:
             dct_list.append(dct_feat)
 
         shape_arr = np.stack(shape_list, axis=0).astype(np.float32)  # (T, 2)
-        dct_arr = np.stack(dct_list, axis=0).astype(np.float32)      # (T, N_DCT_COEFFS)
+        dct_arr = np.stack(dct_list, axis=0).astype(np.float32)  # (T, N_DCT_COEFFS)
 
         # PCA appearance：对每帧 ROI flatten 后做 transform
-        flat = roi_seq.reshape(T, H * W)           # (T, H*W)
+        flat = roi_seq.reshape(T, H * W)  # (T, H*W)
         pca_arr = pca.transform(flat).astype(np.float32)  # (T, n_pca_eff)
 
         # Hybrid: shape + DCT（文档中的 Hybrid = shape + appearance）
-        hybrid_arr = np.concatenate([shape_arr, dct_arr], axis=1)  # (T, 2 + N_DCT_COEFFS)
+        hybrid_arr = np.concatenate(
+            [shape_arr, dct_arr], axis=1
+        )  # (T, 2 + N_DCT_COEFFS)
 
         # 写盘
         np.save(visual_out_dir / f"{base_id}_shape.npy", shape_arr)
