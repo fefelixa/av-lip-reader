@@ -29,7 +29,7 @@ ROOT_DIR = Path(__file__).resolve().parent
 VIDEO_ROOT = ROOT_DIR / "long_videos"
 ROI_ROOT = ROOT_DIR / "roi_npy"
 FACE_CASCADE_PATH = ROOT_DIR / "haarcascades" / "haarcascade_frontalface_default.xml"
-MOUTH_CASCADE_PATH = ROOT_DIR / "haarcascades" / "haarcascade_smile.xml"
+MOUTH_CASCADE_PATH = ROOT_DIR / "haarcascades" / "haarcascade_mcs_mouth.xml"
 
 
 # ----------------- 检测器初始化（参考 face_detection_script.py） -----------------
