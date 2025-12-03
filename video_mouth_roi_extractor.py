@@ -1,23 +1,23 @@
 """
 Video mouth ROI extraction for visual speech.
 
-对应文档：
-- Images-and-video-lab.pdf / Images-and-video-notes.pdf：
-  视频逐帧读取、灰度化、ROI 操作
-- visual-speech-features-notes.pdf：
-  基于嘴部区域的视觉特征（mouth ROI）
-- face_detection_script.py + haarcascades/*.xml：
-  人脸 + 嘴部 Haar 级联检测 (Viola-Jones)
+Relevant documents:
+- Images-and-video-lab.pdf / Images-and-video-notes.pdf:
+  frame-wise video reading, grayscale conversion, ROI operations
+- visual-speech-features-notes.pdf:
+  visual features based on mouth region (mouth ROI)
+- face_detection_script.py + haarcascades/*.xml:
+  face + mouth Haar cascade detection (Viola-Jones)
 
-    ROOT          = 本文件所在目录 (例如 D:/av-lip-reader)
-    VIDEO_ROOT    = ROOT / "long_videos"     # .mov 视频根目录
-    ROI_ROOT      = ROOT / "roi_npy"         # ROI 序列输出目录
-    CASCADE_DIR   = ROOT / "haarcascades"    # Haar 模型目录
+    ROOT          = directory of this file (e.g. D:/av-lip-reader)
+    VIDEO_ROOT    = ROOT / "short_videos"     # .mov video root directory
+    ROI_ROOT      = ROOT / "roi_npy"          # ROI sequence output directory
+    CASCADE_DIR   = ROOT / "haarcascades"     # Haar model directory
 
-
-- 递归扫描 VIDEO_ROOT 下所有 *.mov
-- 对每个视频抽取嘴部 ROI 序列，尺寸统一为 64x64，归一化到 [0,1]
-- 保存到 ROI_ROOT / "<原文件名>_roi.npy"，shape = (T, 64, 64)
+Pipeline:
+- Recursively scan all *.mov under VIDEO_ROOT
+- For each video, extract mouth ROI sequence, normalize size to 64x64, values in [0,1]
+- Save to ROI_ROOT / "<original file name>_roi.npy", shape = (T, 64, 64)
 """
 
 from pathlib import Path
@@ -26,22 +26,23 @@ import numpy as np
 
 
 ROOT_DIR = Path(__file__).resolve().parent
-VIDEO_ROOT = ROOT_DIR / "long_videos"
+VIDEO_ROOT = ROOT_DIR / "short_videos"
 ROI_ROOT = ROOT_DIR / "roi_npy"
 FACE_CASCADE_PATH = ROOT_DIR / "haarcascades" / "haarcascade_frontalface_default.xml"
 MOUTH_CASCADE_PATH = ROOT_DIR / "haarcascades" / "haarcascade_mcs_mouth.xml"
 
 
-# ----------------- 检测器初始化（参考 face_detection_script.py） -----------------
+# ----------------- Detector initialization (refer to face_detection_script.py) -----------------
+
 
 def init_detectors():
     """
-    加载 OpenCV Haar 级联分类器。
+    Load OpenCV Haar cascade classifiers.
 
-    对应文档：
+    Relevant documents:
     - haarcascades/haarcascade_frontalface_default.xml
     - haarcascades/haarcascade_smile.xml
-    - face_detection_script.py 中的人脸与 smile 检测配置
+    - Face and smile detection configuration in face_detection_script.py
     """
     face_cascade = cv.CascadeClassifier(str(FACE_CASCADE_PATH))
     mouth_cascade = cv.CascadeClassifier(str(MOUTH_CASCADE_PATH))
@@ -56,9 +57,9 @@ def init_detectors():
 
 def select_main_face(faces):
     """
-    选择面积最大的脸作为主脸。
+    Select the largest face as the primary face.
 
-    对应 visual-speech-features-notes.pdf 中“主目标选择”思路。
+    Consistent with the “main target selection” logic in visual-speech-features-notes.pdf.
     """
     if len(faces) == 0:
         return None
@@ -67,7 +68,8 @@ def select_main_face(faces):
     return areas[0][1]
 
 
-# ----------------- 单帧嘴部 ROI 提取 -----------------
+# ----------------- Single-frame mouth ROI extraction -----------------
+
 
 def extract_mouth_roi_from_frame(
     frame_bgr,
@@ -76,20 +78,20 @@ def extract_mouth_roi_from_frame(
     target_size=(64, 64),
 ):
     """
-    从单帧图像中提取嘴部 ROI。
+    Extract mouth ROI from a single frame.
 
-    流程完全对齐文档：
-    1. BGR 转灰度（Images-and-video-lab.pdf）
-    2. Haar 人脸检测（face_detection_script.py / Viola-Jones）
-    3. 取人脸下半部分作为嘴部搜索区域（face_detection_script.py）
-    4. 在该区域上做 smile 检测，得到 mouth ROI
-       （visual-speech-features-notes.pdf 中 mouth ROI 概念）
-    5. ROI 统一 resize 到 target_size（size normalisation）
+    Process aligned with the docs:
+    1. Convert BGR to grayscale (Images-and-video-lab.pdf)
+    2. Haar face detection (face_detection_script.py / Viola-Jones)
+    3. Take the lower half of the face as the mouth search region (face_detection_script.py)
+    4. Run smile detection on this region to approximate the mouth ROI
+       (mouth ROI concept in visual-speech-features-notes.pdf)
+    5. Resize ROI to target_size for size normalization
     """
-    # 转灰度
+    # Convert to grayscale
     gray = cv.cvtColor(frame_bgr, cv.COLOR_BGR2GRAY)
 
-    # 人脸检测
+    # Face detection
     faces = face_cascade.detectMultiScale(
         gray,
         scaleFactor=1.1,
@@ -104,14 +106,14 @@ def extract_mouth_roi_from_frame(
 
     x, y, w, h = main_face
 
-    # 人脸下半部作为嘴部候选区域（与 face_detection_script.py 一致）
+    # Lower half of the face as mouth candidate region (same as face_detection_script.py)
     mouth_region_y = int(y + h * 0.55)
     mouth_region_h = int(h * 0.45)
     mouth_region = gray[mouth_region_y: mouth_region_y + mouth_region_h, x: x + w]
     if mouth_region.size == 0:
         return None
 
-    # 在候选区域内检测“笑容”（mouth proxy）
+    # Detect “smile” in candidate region as a proxy for mouth
     mouths = mouth_cascade.detectMultiScale(
         mouth_region,
         scaleFactor=1.1,
@@ -121,27 +123,28 @@ def extract_mouth_roi_from_frame(
     )
 
     if len(mouths) > 0:
-        # 选面积最大的 mouth 框
+        # Select the largest mouth box
         areas = [(mw * mh, (mx, my, mw, mh)) for (mx, my, mw, mh) in mouths]
         areas.sort(key=lambda t: t[0], reverse=True)
         _, (mx, my, mw, mh) = areas[0]
         mouth_roi = mouth_region[my: my + mh, mx: mx + mw]
     else:
-        # 检测不到时退化为整个 mouth_region 保证时序连续
+        # Fallback: use entire mouth_region to keep temporal continuity
         mouth_roi = mouth_region
 
     if mouth_roi.size == 0:
         return None
 
-    # 统一尺寸（size normalisation）
+    # Size normalization
     mouth_roi = cv.resize(mouth_roi, target_size, interpolation=cv.INTER_AREA)
 
-    # 归一化到 [0,1]，方便后续 DCT / PCA（visual-speech-features-lab.pdf）
+    # Normalize to [0,1] for downstream DCT / PCA (visual-speech-features-lab.pdf)
     mouth_roi = mouth_roi.astype(np.float32) / 255.0
     return mouth_roi
 
 
-# ----------------- 单个视频处理 -----------------
+# ----------------- Single video processing -----------------
+
 
 def process_single_video(
     video_path: Path,
@@ -151,12 +154,18 @@ def process_single_video(
     every_nth: int = 1,
     max_frames=None,
     target_size=(64, 64),
+    debug: bool = False,
 ):
     """
-    将单个视频转成 mouth ROI 序列，保存为 .npy，shape=(T, H, W)。
+    Convert a single video into a mouth ROI sequence and save as .npy, shape=(T, H, W).
 
-    对应 Images-and-video-lab.pdf 中“逐帧处理视频”、
-    visual-speech-features-lab.pdf 中对 mouth ROI 的时序建模。
+    Consistent with:
+    - Frame-wise video processing in Images-and-video-lab.pdf
+    - Temporal modeling of mouth ROI in visual-speech-features-lab.pdf
+
+    When debug=True:
+    - Display the original frame and extracted mouth ROI in real time
+    - Press 'q' to interrupt processing of the current video
     """
     cap = cv.VideoCapture(str(video_path))
     if not cap.isOpened():
@@ -171,7 +180,7 @@ def process_single_video(
         if not ret:
             break
 
-        # 每隔 every_nth 帧取一帧
+        # Take every_nth frame
         if frame_idx % every_nth != 0:
             frame_idx += 1
             continue
@@ -182,11 +191,27 @@ def process_single_video(
         if roi is not None:
             rois.append(roi)
 
+            # --------- Debug visualization logic (option A) ---------
+            if debug:
+                # ROI is [0,1] float grayscale; convert to 0–255 for display
+                roi_vis = (roi * 255).astype("uint8")
+
+                cv.imshow("original frame", frame)
+                cv.imshow("mouth roi", roi_vis)
+
+                # 30ms per frame; press q to break current video
+                key = cv.waitKey(30) & 0xFF
+                if key == ord("q"):
+                    print(f"[INFO] Debug interrupted by user on video: {video_path}")
+                    break
+
         frame_idx += 1
         if max_frames is not None and len(rois) >= max_frames:
             break
 
     cap.release()
+    if debug:
+        cv.destroyAllWindows()
 
     if len(rois) == 0:
         print(f"[WARN] No mouth ROI extracted for {video_path}")
@@ -201,12 +226,16 @@ def process_single_video(
     print(f"[INFO] Saved ROI sequence: {out_path}  shape={rois.shape}")
 
 
-# ----------------- 批量处理 long_videos 下所有 .mov -----------------
+# ----------------- Batch process all .mov under short_videos -----------------
 
-def process_all_videos():
+
+def process_all_videos(debug: bool = False):
     """
-    批量处理 VIDEO_ROOT 下所有 *.mov。
-    使用 Path.rglob("*.mov") 递归所有子目录。
+    Batch process all *.mov under VIDEO_ROOT.
+
+    Uses Path.rglob("*.mov") to traverse all subdirectories.
+
+    When debug=True, every video will pop up a window showing original frame + mouth ROI.
     """
     face_cascade, mouth_cascade = init_detectors()
 
@@ -225,15 +254,19 @@ def process_all_videos():
     print(f"[INFO] Found {len(video_files)} video files.")
 
     for vp in video_files:
+        print(f"[INFO] Processing: {vp}")
         process_single_video(
             video_path=vp,
             out_dir=out_root,
             face_cascade=face_cascade,
             mouth_cascade=mouth_cascade,
-            every_nth=1,   # 可以按需要调整
-            max_frames=80, # 每个视频最多 80 帧
+            every_nth=1,   # Adjust if needed
+            max_frames=80,  # Max 80 frames per video
             target_size=(64, 64),
+            debug=debug,
         )
 
+
 if __name__ == "__main__":
-    process_all_videos()
+    # Debug flag to inspect whether mouth ROI is correct
+    process_all_videos(debug=False)

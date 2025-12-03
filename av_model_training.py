@@ -1,81 +1,67 @@
 """
-Audio-Visual model training.
+Audio-Visual lip-reading CNN training.
 
-对应“模型训练”阶段，基于：
-- Lab 4 Speech recognition.pdf / final_modelling.py 中的 CNN 语音识别网络结构
-- visual-speech-features-lab.pdf / visual-speech-features-notes.pdf 中的
-  * visual feature 插值（将视觉特征对齐到音频帧率，用作 early integration）
-  * audio-visual 早期融合（feature concatenation）
+goals:
+- Use audio MFCC features from audio_feats + hybrid features from visual_feats
+- Build an audio-visual early integration model
+- Align with the “Audio-visual speech recognition” part of the coursework
 
-输入特征由 av_feature_extraction.py 生成：
-- audio: <base_id>_audio_mfcc.npy，shape: (D_a, T_a)
-- visual: <base_id>_hybrid.npy，shape: (T_v, D_v)
+Prerequisites:
+- feature.py has been executed and generated:
+    audio_feats/
+        <base_id>_audio_mfcc.npy       shape=(D_a, T_a)
+    visual_feats/hybrid/
+        <base_id>_hybrid.npy           shape=(T_v, D_v)
+- NAMES.txt / name.txt contains all name labels (one name per line)
+
+Notes:
+- Audio and visual are paired via <base_id>: <base_id>_audio_mfcc ↔ <base_id>_hybrid
+- Resample visual over time to match the number of audio frames, then concatenate along feature dimension
+- Normalize the time dimension to a fixed length TARGET_T before feeding into Conv2D
 """
 
+from __future__ import annotations
+
 from pathlib import Path
+from typing import List, Tuple
 
 import numpy as np
 from sklearn.model_selection import train_test_split
 from tensorflow.keras.callbacks import EarlyStopping, ModelCheckpoint
-from tensorflow.keras.layers import Conv2D, Dense, Dropout, Flatten, InputLayer, MaxPooling2D
+from tensorflow.keras.layers import (
+    Conv2D,
+    Dense,
+    Dropout,
+    Flatten,
+    InputLayer,
+    MaxPooling2D,
+)
 from tensorflow.keras.models import Sequential
+from tensorflow.keras.utils import to_categorical
 
-
-# ===================== 路径默认值：按 av-lip-reader 结构 =====================
+# ===================== Paths and configuration =====================
 
 ROOT_DIR = Path(__file__).resolve().parent
-DEFAULT_AUDIO_FEAT_DIR = ROOT_DIR / "audio_feats"
-DEFAULT_VISUAL_FEAT_DIR = ROOT_DIR / "visual_feats"
-DEFAULT_NAMES_FILE = ROOT_DIR / "NAMES.txt"
-DEFAULT_MODEL_OUT = ROOT_DIR / "models" / "av_cnn_model.h5"
+
+# Audio / visual feature directories (update if your actual directories differ)
+AUDIO_FEAT_DIR = ROOT_DIR / "audio_feats" / "mfcc"
+VISUAL_HYBRID_DIR = ROOT_DIR / "visual_feats" / "hybrid"
+
+NAMES_FILE = ROOT_DIR / "NAMES.txt"
+
+AV_MODEL_OUT = ROOT_DIR / "models" / "visual_cnn_hybrid.h5"
+AV_MODEL_OUT.parent.mkdir(parents=True, exist_ok=True)
+
+TARGET_T = 40  # Unified number of time frames; aligned with visual-only for comparability
+RANDOM_STATE = 0
+TEST_VAL_RATIO = 0.2  # 80/10/10
+
+# ===================== Utility functions =====================
 
 
-# ===================== 时间对齐：视觉特征插值到音频帧率 =====================
-
-
-def interp_visual_to_audio_rate(visual_seq, audio_seq_time_first):
-    """
-    将视觉特征（低帧率）插值到音频特征的时间轴。
-
-    visual_seq: shape (T_v, D_v)  —— T_v 为视觉帧数
-    audio_seq_time_first: shape (T_a, D_a) —— T_a 为音频帧数（时间为第一维）
-
-    返回：
-        visual_interp: shape (T_a, D_v)
-
-    逻辑对应 visual-speech-features-lab.pdf / visual-speech-features-notes.pdf 中的：
-    - 将视觉帧索引映射到 [0,1]
-    - 将音频帧索引映射到 [0,1]
-    - 对每个维度做 1D 线性插值
-    """
-    visual_seq = np.asarray(visual_seq, dtype=np.float32)
-    audio_seq_time_first = np.asarray(audio_seq_time_first, dtype=np.float32)
-
-    T_v, D_v = visual_seq.shape
-    T_a = audio_seq_time_first.shape[0]
-
-    if T_v == 1:
-        # 只有一个视觉帧时，简单 repeat
-        return np.repeat(visual_seq, T_a, axis=0)
-
-    t_v = np.linspace(0.0, 1.0, T_v)
-    t_a = np.linspace(0.0, 1.0, T_a)
-
-    visual_interp = np.empty((T_a, D_v), dtype=np.float32)
-    for d in range(D_v):
-        visual_interp[:, d] = np.interp(t_a, t_v, visual_seq[:, d])
-
-    return visual_interp
-
-
-# ===================== 数据加载：从 .npy 构建 AV 特征和标签 =====================
-
-
-def load_names(names_file: Path):
-    """
-    从 NAMES.txt 读取类别名称列表。
-    """
-    names: list[str] = []
+def load_names(names_file: Path) -> List[str]:
+    """Load class names from NAMES.txt."""
+    names: List[str] = []
     with open(names_file, "r", encoding="utf-8") as f:
         for line in f:
             name = line.strip()
@@ -84,16 +70,89 @@ def load_names(names_file: Path):
     return names
 
 
-def load_av_dataset(audio_feat_dir: Path, visual_feat_dir: Path, names_file: Path):
+def interp_visual_to_audio_rate(
+    visual_seq: np.ndarray,
+    audio_time_first: np.ndarray,
+) -> np.ndarray:
     """
-    从音频和视觉特征目录构建音视频融合数据集。
+    Resample visual sequence to match the audio time axis.
 
-    - audio: <base_id>_audio_mfcc.npy，shape: (D_a, T_a)
-    - visual hybrid: <base_id>_hybrid.npy，shape: (T_v, D_v)
+    Args:
+        visual_seq: shape=(T_v, D_v)
+        audio_time_first: shape=(T_a, D_a), only T_a is used as the time reference
 
-    label 映射策略：
+    Returns:
+        visual_interp: shape=(T_a, D_v)
+    """
+    if visual_seq.ndim != 2:
+        raise ValueError(f"visual_seq must be 2D, got {visual_seq.shape}")
+
+    T_v, D_v = visual_seq.shape
+    T_a = audio_time_first.shape[0]
+
+    if T_v == 0 or T_a == 0:
+        return np.zeros((T_a, D_v), dtype=np.float32)
+
+    # Normalize both to [0, 1] and perform linear interpolation
+    src_t = np.linspace(0.0, 1.0, T_v, dtype=np.float32)
+    tgt_t = np.linspace(0.0, 1.0, T_a, dtype=np.float32)
+
+    out = np.zeros((T_a, D_v), dtype=np.float32)
+    for d in range(D_v):
+        out[:, d] = np.interp(tgt_t, src_t, visual_seq[:, d])
+
+    return out
+
+
+def pad_or_crop_time(seq_time_first: np.ndarray, target_T: int) -> np.ndarray:
+    """
+    Align along the time dimension.
+
+    Input:  shape=(T, D)
+    Output: shape=(D, target_T)
+
+    The logic is kept consistent with visual_only_model_training for fair comparison.
+    """
+    if seq_time_first.ndim != 2:
+        raise ValueError(f"expect (T, D), got {seq_time_first.shape}")
+
+    T, D = seq_time_first.shape
+
+    if T == target_T:
+        return seq_time_first.T
+
+    if T > target_T:
+        start = (T - target_T) // 2
+        end = start + target_T
+        cropped = seq_time_first[start:end, :]
+        return cropped.T
+
+    pad_len = target_T - T
+    pad = np.zeros((pad_len, D), dtype=seq_time_first.dtype)
+    padded = np.vstack([seq_time_first, pad])
+    return padded.T
+
+
+def load_av_dataset(
+    audio_feat_dir: Path,
+    visual_feat_dir: Path,
+    names_file: Path,
+    target_T: int,
+) -> Tuple[np.ndarray, np.ndarray, list]:
+    """
+    Build an audio-visual fused dataset from audio and visual feature directories.
+
+    - audio: <base_id>_audio_mfcc.npy, shape: (D_a, T_a)
+    - visual hybrid: <base_id>_hybrid.npy, shape: (T_v, D_v)
+
+    Label mapping strategy:
     - label_name = base_id.split("_")[0]
-    - label_name 必须出现在 NAMES.txt 列表中
+    - label_name must exist in the NAMES.txt list
+
+    Returns:
+        X: (N, freq, time, 1)
+        y_cat: (N, num_classes)
+        names: List[str]
     """
     audio_dir = Path(audio_feat_dir)
     visual_dir = Path(visual_feat_dir)
@@ -122,136 +181,115 @@ def load_av_dataset(audio_feat_dir: Path, visual_feat_dir: Path, names_file: Pat
             print(f"[WARN] Missing visual hybrid for {base_id}: {visual_path}")
             continue
 
-        # 加载 audio / visual 特征
-        audio_feat = np.load(audio_path).astype(np.float32)           # (D_a, T_a)
-        visual_hybrid_seq = np.load(visual_path).astype(np.float32)   # (T_v, D_v)
+        # Load audio / visual features
+        audio_feat = np.load(audio_path).astype(np.float32)  # (D_a, T_a)
+        visual_hybrid_seq = np.load(visual_path).astype(np.float32)  # (T_v, D_v)
 
-        # 将 visual 重采样到 audio 时间轴（时间维度先转到第 0 维）
+        if audio_feat.ndim != 2 or visual_hybrid_seq.ndim != 2:
+            print(
+                f"[WARN] bad shapes audio={audio_feat.shape}, visual={visual_hybrid_seq.shape}, "
+                f"skip {base_id}"
+            )
+            continue
+
+        # Resample visual to match audio time axis (first move time to axis 0)
         T_a = audio_feat.shape[1]
         audio_time_first = audio_feat.T  # (T_a, D_a)
         visual_interp_time_first = interp_visual_to_audio_rate(
             visual_hybrid_seq, audio_time_first
         )  # (T_a, D_v)
 
-        # 再转回 (D_v, T_a)，方便与 audio_feat 在频率维拼接
+        # Convert back to (D_v, T_a), to concatenate with audio_feat along frequency dimension
         visual_interp = visual_interp_time_first.T  # (D_v, T_a)
 
-        # Early integration：在“频率/特征维”上拼接
-        fused = np.concatenate([audio_feat, visual_interp], axis=0)  # (D_total, T_a)
+        # Early integration: concatenate along the "frequency/feature" dimension → (D_total, T_a)
+        fused = np.concatenate([audio_feat, visual_interp], axis=0)
 
-        X_list.append(fused)
+        # Normalize time dimension to target_T (convert to (T, D_total) then pad/crop)
+        fused_fixed = pad_or_crop_time(fused.T, target_T=target_T)  # (D_total, target_T)
+
+        X_list.append(fused_fixed)
         y_list.append(label_to_idx[label_name])
 
     if not X_list:
         raise RuntimeError("No valid audio-visual feature pairs found.")
 
-    # 统一时间长度（T 维），并加入通道维度，形状与 final_modelling.py 中 CNN 输入一致：(N, D, T, 1)
-    max_T = max(arr.shape[1] for arr in X_list)
-    D_total = X_list[0].shape[0]
-    N = len(X_list)
-
-    X = np.zeros((N, D_total, max_T), dtype=np.float32)
-    for i, arr in enumerate(X_list):
-        T = arr.shape[1]
-        X[i, :, :T] = arr  # 后面是零填充
-
-    # 全局幅度归一化（参考 final_modelling.py）
-    max_abs = np.max(np.abs(X))
-    if max_abs > 0:
-        X = X / max_abs
-
-    # 加通道维（CNN 期望 [freq, time, channel]）
-    X = X[..., np.newaxis]  # (N, D_total, max_T, 1)
-
+    X = np.stack(X_list, axis=0)  # (N, D_total, target_T)
     y = np.array(y_list, dtype=np.int64)
 
-    return X, y, names
+    # Add channel dimension
+    X = X[..., np.newaxis]  # (N, freq, time, 1)
+
+    num_classes = len(names)
+    y_cat = to_categorical(y, num_classes=num_classes)
+
+    print(f"[INFO] AV dataset loaded: X={X.shape}, y={y_cat.shape}")
+    return X, y_cat, names
 
 
-# ===================== 模型结构：基于 Lab 4 CNN =====================
+# ===================== Model definition (CNN) =====================
 
 
-def create_av_cnn_model(freq_bins: int, time_steps: int, num_classes: int) -> Sequential:
+def create_av_cnn(input_freq: int, input_time: int, num_classes: int) -> Sequential:
     """
-    构建与 Lab 4 Speech recognition / final_modelling.py 同风格的 2D CNN 模型，
-    但输入通道改为 audio+visual 融合特征。
-
-    input_shape: (freq_bins, time_steps, 1)
+    AV CNN architecture: aligned with the visual-only network for fair comparison.
     """
     model = Sequential()
-    model.add(InputLayer(input_shape=(freq_bins, time_steps, 1)))
-
-    # 与 final_modelling.py 类似的卷积 + 池化结构
-    model.add(Conv2D(64, (3, 3), activation="relu", padding="same"))
-    model.add(MaxPooling2D(pool_size=(3, 3), strides=(2, 2)))
-
-    model.add(Conv2D(128, (3, 3), activation="relu", padding="same"))
-    model.add(MaxPooling2D(pool_size=(3, 3), strides=(2, 2)))
-
+    model.add(InputLayer(input_shape=(input_freq, input_time, 1)))
+    model.add(Conv2D(64, (3, 3), activation="relu"))
+    model.add(MaxPooling2D(pool_size=(3, 3)))
     model.add(Flatten())
     model.add(Dense(256, activation="relu"))
     model.add(Dropout(0.5))
     model.add(Dense(num_classes, activation="softmax"))
 
     model.compile(
-        optimizer="adam",
-        loss="sparse_categorical_crossentropy",
+        loss="categorical_crossentropy",
         metrics=["accuracy"],
+        optimizer="adam",
     )
+    model.summary()
     return model
 
 
-# ===================== 训练入口 =====================
+# ===================== Main pipeline: split data + train + test =====================
 
 
-def train_av_model(
-    audio_feat_dir: Path = DEFAULT_AUDIO_FEAT_DIR,
-    visual_feat_dir: Path = DEFAULT_VISUAL_FEAT_DIR,
-    names_file: Path = DEFAULT_NAMES_FILE,
-    model_out_path: Path = DEFAULT_MODEL_OUT,
-    test_size: float = 0.2,
-    random_state: int = 42,
-    batch_size: int = 32,
-    epochs: int = 50,
-):
-    """
-    从 audio / visual 特征目录中加载 AV 数据集，拆分 train/val，并训练 CNN 模型。
-    """
+def main() -> None:
+    print(f"[INFO] AUDIO_FEAT_DIR   = {AUDIO_FEAT_DIR}")
+    print(f"[INFO] VISUAL_HYBRID_DIR= {VISUAL_HYBRID_DIR}")
+    print(f"[INFO] NAMES_FILE       = {NAMES_FILE}")
+    print(f"[INFO] TARGET_T         = {TARGET_T}")
+
     X, y, names = load_av_dataset(
-        audio_feat_dir=audio_feat_dir,
-        visual_feat_dir=visual_feat_dir,
-        names_file=names_file,
+        audio_feat_dir=AUDIO_FEAT_DIR,
+        visual_feat_dir=VISUAL_HYBRID_DIR,
+        names_file=NAMES_FILE,
+        target_T=TARGET_T,
     )
 
-    freq_bins = X.shape[1]
-    time_steps = X.shape[2]
-    num_classes = len(names)
+    num_classes = y.shape[1]
+    _, freq, time, _ = X.shape
 
-    print(f"[INFO] Dataset: N={X.shape[0]}, freq_bins={freq_bins}, "
-          f"time_steps={time_steps}, classes={num_classes}")
-
-    X_train, X_val, y_train, y_val = train_test_split(
-        X,
-        y,
-        test_size=test_size,
-        stratify=y,
-        random_state=random_state,
+    X_train, X_tmp, y_train, y_tmp = train_test_split(
+        X, y, test_size=TEST_VAL_RATIO, random_state=RANDOM_STATE, stratify=y
+    )
+    X_val, X_test, y_val, y_test = train_test_split(
+        X_tmp, y_tmp, test_size=0.5, random_state=RANDOM_STATE, stratify=y_tmp
     )
 
-    model = create_av_cnn_model(freq_bins, time_steps, num_classes)
+    print(f"[INFO] Train: {X_train.shape}, Val: {X_val.shape}, Test: {X_test.shape}")
 
-    # 确保模型输出目录存在
-    model_out_path = Path(model_out_path)
-    model_out_path.parent.mkdir(parents=True, exist_ok=True)
+    model = create_av_cnn(input_freq=freq, input_time=time, num_classes=num_classes)
 
     callbacks = [
         EarlyStopping(
             monitor="val_loss",
-            patience=8,
+            patience=5,
             restore_best_weights=True,
         ),
         ModelCheckpoint(
-            filepath=str(model_out_path),
+            filepath=str(AV_MODEL_OUT),
             monitor="val_loss",
             save_best_only=True,
         ),
@@ -261,32 +299,15 @@ def train_av_model(
         X_train,
         y_train,
         validation_data=(X_val, y_val),
-        batch_size=batch_size,
-        epochs=epochs,
-        callbacks=callbacks,
-    )
-
-    print("[INFO] Training finished. Best model saved to", model_out_path)
-    return model, history, names
-
-
-def main():
-    print("[INFO] Using default paths for AV model training")
-    print(f"[INFO] AUDIO_FEAT_DIR  = {DEFAULT_AUDIO_FEAT_DIR}")
-    print(f"[INFO] VISUAL_FEAT_DIR = {DEFAULT_VISUAL_FEAT_DIR}")
-    print(f"[INFO] NAMES_FILE      = {DEFAULT_NAMES_FILE}")
-    print(f"[INFO] MODEL_OUT       = {DEFAULT_MODEL_OUT}")
-
-    train_av_model(
-        audio_feat_dir=DEFAULT_AUDIO_FEAT_DIR,
-        visual_feat_dir=DEFAULT_VISUAL_FEAT_DIR,
-        names_file=DEFAULT_NAMES_FILE,
-        model_out_path=DEFAULT_MODEL_OUT,
-        test_size=0.2,
-        batch_size=32,
         epochs=50,
-        random_state=42,
+        batch_size=32,
+        callbacks=callbacks,
+        verbose=1,
     )
+
+    print("[INFO] Evaluate on test set...")
+    test_loss, test_acc = model.evaluate(X_test, y_test, verbose=0)
+    print(f"[RESULT] AV test accuracy = {test_acc:.4f}, loss = {test_loss:.4f}")
 
 
 if __name__ == "__main__":
