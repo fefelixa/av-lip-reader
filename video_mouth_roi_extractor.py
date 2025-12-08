@@ -127,7 +127,32 @@ def extract_mouth_roi_from_frame(
         areas = [(mw * mh, (mx, my, mw, mh)) for (mx, my, mw, mh) in mouths]
         areas.sort(key=lambda t: t[0], reverse=True)
         _, (mx, my, mw, mh) = areas[0]
-        mouth_roi = mouth_region[my: my + mh, mx: mx + mw]
+
+        # ===== 放大 + 正方形 + 轻微上移 =====
+        scale = 1.4  # 轻度放大，1.3~1.5 都可以试
+
+        cx = mx + mw / 2.0
+        cy = my + mh / 2.0
+
+        # 取较大的边做正方形，保证嘴巴居中
+        side = int(max(mw, mh) * scale)
+
+        # 轻微往上移一点，让嘴巴偏上，中间留更多下巴空间
+        shift_up = int(0.1 * side)
+        cy = cy - shift_up
+
+        x0 = int(cx - side / 2.0)
+        y0 = int(cy - side / 2.0)
+        x1 = int(cx + side / 2.0)
+        y1 = int(cy + side / 2.0)
+
+        # 边界裁剪，防止越界
+        x0 = max(0, x0)
+        y0 = max(0, y0)
+        x1 = min(mouth_region.shape[1], x1)
+        y1 = min(mouth_region.shape[0], y1)
+
+        mouth_roi = mouth_region[y0:y1, x0:x1]
     else:
         # Fallback: use entire mouth_region to keep temporal continuity
         mouth_roi = mouth_region
@@ -270,3 +295,4 @@ def process_all_videos(debug: bool = False):
 if __name__ == "__main__":
     # Debug flag to inspect whether mouth ROI is correct
     process_all_videos(debug=False)
+
