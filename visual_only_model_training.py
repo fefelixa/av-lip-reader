@@ -18,18 +18,32 @@ from typing import List, Tuple
 
 import numpy as np
 from sklearn.model_selection import train_test_split
-from tensorflow.keras.callbacks import EarlyStopping, ModelCheckpoint
-from tensorflow.keras.layers import (
-    Conv2D,
-    Dense,
-    Dropout,
-    Flatten,
-    InputLayer,
-    MaxPooling2D,
-)
-from tensorflow.keras.models import Sequential
-from tensorflow.keras.utils import to_categorical
 
+try:
+    from tensorflow.keras.callbacks import EarlyStopping, ModelCheckpoint
+    from tensorflow.keras.layers import (
+        Conv2D,
+        Dense,
+        Dropout,
+        Flatten,
+        InputLayer,
+        MaxPooling2D,
+    )
+    from tensorflow.keras.models import Sequential
+    from tensorflow.keras.utils import to_categorical
+except:
+    import tensorflow as tf
+
+    EarlyStopping = tf.keras.callbacks.EarlyStopping
+    ModelCheckpoint = tf.keras.callbacks.ModelCheckpoint
+    Conv2D = tf.keras.layers.Conv2D
+    Dense = tf.keras.layers.Dense
+    Dropout = tf.keras.layers.Dropout
+    Flatten = tf.keras.layers.Flatten
+    InputLayer = tf.keras.layers.InputLayer
+    MaxPooling2D = tf.keras.layers.MaxPooling2D
+    Sequential = tf.keras.models.Sequential
+    to_categorical = tf.keras.utils.to_categorical
 # ===================== Paths and configuration =====================
 
 ROOT_DIR = Path(__file__).resolve().parent
