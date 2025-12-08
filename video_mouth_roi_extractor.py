@@ -23,6 +23,7 @@ Pipeline:
 from pathlib import Path
 import cv2 as cv
 import numpy as np
+from tqdm import tqdm
 
 
 ROOT_DIR = Path(__file__).resolve().parent
@@ -109,7 +110,7 @@ def extract_mouth_roi_from_frame(
     # Lower half of the face as mouth candidate region (same as face_detection_script.py)
     mouth_region_y = int(y + h * 0.55)
     mouth_region_h = int(h * 0.45)
-    mouth_region = gray[mouth_region_y: mouth_region_y + mouth_region_h, x: x + w]
+    mouth_region = gray[mouth_region_y : mouth_region_y + mouth_region_h, x : x + w]
     if mouth_region.size == 0:
         return None
 
@@ -129,7 +130,7 @@ def extract_mouth_roi_from_frame(
         _, (mx, my, mw, mh) = areas[0]
 
         # ===== 放大 + 正方形 + 轻微上移 =====
-        scale = 1.4  # 轻度放大，1.3~1.5 都可以试
+        scale = 1.15  # 轻度放大，1.3~1.5 都可以试
 
         cx = mx + mw / 2.0
         cy = my + mh / 2.0
@@ -209,7 +210,6 @@ def process_single_video(
         if frame_idx % every_nth != 0:
             frame_idx += 1
             continue
-
         roi = extract_mouth_roi_from_frame(
             frame, face_cascade, mouth_cascade, target_size=target_size
         )
@@ -248,7 +248,7 @@ def process_single_video(
     out_path = out_dir / f"{video_path.stem}_roi.npy"
     np.save(out_path, rois)
 
-    print(f"[INFO] Saved ROI sequence: {out_path}  shape={rois.shape}")
+    # print(f"[INFO] Saved ROI sequence: {out_path}  shape={rois.shape}")
 
 
 # ----------------- Batch process all .mov under short_videos -----------------
@@ -278,14 +278,14 @@ def process_all_videos(debug: bool = False):
 
     print(f"[INFO] Found {len(video_files)} video files.")
 
-    for vp in video_files:
-        print(f"[INFO] Processing: {vp}")
+    for vp in tqdm(video_files):
+        # print(f"[INFO] Processing: {vp}")
         process_single_video(
             video_path=vp,
             out_dir=out_root,
             face_cascade=face_cascade,
             mouth_cascade=mouth_cascade,
-            every_nth=1,   # Adjust if needed
+            every_nth=1,  # Adjust if needed
             max_frames=80,  # Max 80 frames per video
             target_size=(64, 64),
             debug=debug,
@@ -294,5 +294,4 @@ def process_all_videos(debug: bool = False):
 
 if __name__ == "__main__":
     # Debug flag to inspect whether mouth ROI is correct
-    process_all_videos(debug=False)
-
+    process_all_videos(debug=True)
