@@ -53,7 +53,7 @@ VISUAL_FEAT_ROOT = ROOT_DIR / "visual_feats"
 
 NAMES_FILE = ROOT_DIR / "NAMES.txt"
 
-MODEL_OUT = ROOT_DIR / "models" / "visual_cnn_model.h5"
+MODEL_OUT = ROOT_DIR / "models" / "visual_cnn_model.keras"
 MODEL_OUT.parent.mkdir(parents=True, exist_ok=True)
 
 # Which visual feature to use: "shape" / "dct" / "pca" / "hybrid"
@@ -63,7 +63,7 @@ FEATURE_KIND = "hybrid"
 TARGET_T = 40  # Tunable hyperparameter
 
 RANDOM_STATE = 0
-TEST_VAL_RATIO = 0.2  # Take 20% for val+test, then split into 10%/10%
+TEST_VAL_RATIO = 0.2  # Take 20% for val + test, then split into 10%/10%
 
 # ===================== Utility functions =====================
 
@@ -140,7 +140,7 @@ def load_visual_dataset(
         names: List[str]
     """
     names = load_names(names_file)
-    label_to_idx = {name: idx for idx, name in enumerate(names)}
+    label_to_idx = {name.strip().lower(): idx for idx, name in enumerate(names)}
 
     subdir, suffix = get_visual_subdir_and_suffix(feature_kind)
     feat_dir = visual_feat_root / subdir
@@ -150,7 +150,9 @@ def load_visual_dataset(
 
     feat_files = sorted(feat_dir.glob(f"*{suffix}"))
     if not feat_files:
-        raise RuntimeError(f"No visual feature files found in {feat_dir} with suffix {suffix}")
+        raise RuntimeError(
+            f"No visual feature files found in {feat_dir} with suffix {suffix}"
+        )
 
     X_list: list[np.ndarray] = []
     y_list: list[int] = []
@@ -158,7 +160,7 @@ def load_visual_dataset(
     for feat_path in feat_files:
         base_id = feat_path.stem.replace(suffix.replace(".npy", ""), "")
         # More robust approach: derive label directly from file name
-        label_name = base_id.split("_")[0]
+        label_name = base_id.split("_")[0][:-3]
 
         if label_name not in label_to_idx:
             print(f"[WARN] label {label_name} not in NAMES.txt, skip {feat_path}")
@@ -192,7 +194,7 @@ def load_visual_dataset(
 # ===================== Model definition (CNN) =====================
 
 
-def create_visual_cnn(input_freq: int, input_time: int, num_classes: int) -> Sequential:
+def create_visual_cnn(input_freq: int, input_time: int, num_classes: int):
     """
     Simple CNN aligned with Lab 4, with configurable input dimensions and number of classes.
     """
@@ -263,7 +265,7 @@ def main() -> None:
         y_train,
         validation_data=(X_val, y_val),
         epochs=50,
-        batch_size=32,
+        batch_size=8,
         callbacks=callbacks,
         verbose=1,
     )
