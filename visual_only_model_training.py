@@ -256,8 +256,11 @@ def main() -> None:
 
     print("[INFO] Evaluate on test set...")
     test_loss, test_acc = model.evaluate(X_test, y_test, verbose=0)
-    print(f"[RESULT] Visual-only test accuracy = {test_acc:.4f}, loss = {test_loss:.4f}")
+    print(
+        f"[RESULT] Visual-only test accuracy = {100.0*test_acc:.2f}%, loss = {test_loss:.2f}"
+    )
 
 
 if __name__ == "__main__":
     main()
+print("done")
