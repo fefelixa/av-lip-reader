@@ -23,7 +23,6 @@ Pipeline:
 from pathlib import Path
 import cv2 as cv
 import numpy as np
-from tqdm import tqdm
 
 
 ROOT_DIR = Path(__file__).resolve().parent
@@ -72,27 +71,112 @@ def select_main_face(faces):
 # ----------------- Single-frame mouth ROI extraction -----------------
 
 
+# def extract_mouth_roi_from_frame(
+#     frame_bgr,
+#     face_cascade,
+#     mouth_cascade,
+#     target_size=(96, 96),
+# ):
+#     """
+#     Extract mouth ROI from a single frame.
+#
+#     Process aligned with the docs:
+#     1. Convert BGR to grayscale (Images-and-video-lab.pdf)
+#     2. Haar face detection (face_detection_script.py / Viola-Jones)
+#     3. Take the lower half of the face as the mouth search region (face_detection_script.py)
+#     4. Run smile detection on this region to approximate the mouth ROI
+#        (mouth ROI concept in visual-speech-features-notes.pdf)
+#     5. Resize ROI to target_size for size normalization
+#     """
+#     # Convert to grayscale
+#     gray = cv.cvtColor(frame_bgr, cv.COLOR_BGR2GRAY)
+#
+#     # Face detection
+#     faces = face_cascade.detectMultiScale(
+#         gray,
+#         scaleFactor=1.1,
+#         minNeighbors=5,
+#         flags=cv.CASCADE_SCALE_IMAGE,
+#         minSize=(60, 60),
+#     )
+#
+#     main_face = select_main_face(faces)
+#     if main_face is None:
+#         return None
+#
+#     x, y, w, h = main_face
+#
+#     # Lower half of the face as mouth candidate region (same as face_detection_script.py)
+#     mouth_region_y = int(y + h * 0.55)
+#     mouth_region_h = int(h * 0.45)
+#     mouth_region = gray[mouth_region_y: mouth_region_y + mouth_region_h, x: x + w]
+#     if mouth_region.size == 0:
+#         return None
+#
+#     # Detect “smile” in candidate region as a proxy for mouth
+#     mouths = mouth_cascade.detectMultiScale(
+#         mouth_region,
+#         scaleFactor=1.1,
+#         minNeighbors=15,
+#         flags=cv.CASCADE_SCALE_IMAGE,
+#         minSize=(30, 15),
+#     )
+#
+#     if len(mouths) > 0:
+#         # Select the largest mouth box
+#         areas = [(mw * mh, (mx, my, mw, mh)) for (mx, my, mw, mh) in mouths]
+#         areas.sort(key=lambda t: t[0], reverse=True)
+#         _, (mx, my, mw, mh) = areas[0]
+#
+#         # ===== 放大 + 正方形 + 轻微上移 =====
+#         scale = 1.4  # 轻度放大，1.3~1.5 都可以试
+#
+#         cx = mx + mw / 2.0
+#         cy = my + mh / 2.0
+#
+#         # 取较大的边做正方形，保证嘴巴居中
+#         side = int(max(mw, mh) * scale)
+#
+#         # 轻微往上移一点，让嘴巴偏上，中间留更多下巴空间
+#         shift_up = int(0.1 * side)
+#         cy = cy - shift_up
+#
+#         x0 = int(cx - side / 2.0)
+#         y0 = int(cy - side / 2.0)
+#         x1 = int(cx + side / 2.0)
+#         y1 = int(cy + side / 2.0)
+#
+#         # 边界裁剪，防止越界
+#         x0 = max(0, x0)
+#         y0 = max(0, y0)
+#         x1 = min(mouth_region.shape[1], x1)
+#         y1 = min(mouth_region.shape[0], y1)
+#
+#         mouth_roi = mouth_region[y0:y1, x0:x1]
+#     else:
+#         # Fallback: use entire mouth_region to keep temporal continuity
+#         mouth_roi = mouth_region
+#
+#     if mouth_roi.size == 0:
+#         return None
+#
+#     # Size normalization
+#     mouth_roi = cv.resize(mouth_roi, target_size, interpolation=cv.INTER_AREA)
+#
+#     # Normalize to [0,1] for downstream DCT / PCA (visual-speech-features-lab.pdf)
+#     mouth_roi = mouth_roi.astype(np.float32) / 255.0
+#     return mouth_roi
+
 def extract_mouth_roi_from_frame(
     frame_bgr,
     face_cascade,
     mouth_cascade,
     target_size=(64, 64),
 ):
-    """
-    Extract mouth ROI from a single frame.
-
-    Process aligned with the docs:
-    1. Convert BGR to grayscale (Images-and-video-lab.pdf)
-    2. Haar face detection (face_detection_script.py / Viola-Jones)
-    3. Take the lower half of the face as the mouth search region (face_detection_script.py)
-    4. Run smile detection on this region to approximate the mouth ROI
-       (mouth ROI concept in visual-speech-features-notes.pdf)
-    5. Resize ROI to target_size for size normalization
-    """
-    # Convert to grayscale
+    # 转灰度
     gray = cv.cvtColor(frame_bgr, cv.COLOR_BGR2GRAY)
 
-    # Face detection
+    # 人脸检测
     faces = face_cascade.detectMultiScale(
         gray,
         scaleFactor=1.1,
@@ -107,14 +191,14 @@ def extract_mouth_roi_from_frame(
 
     x, y, w, h = main_face
 
-    # Lower half of the face as mouth candidate region (same as face_detection_script.py)
+    # === 1. mouth 搜索区域恢复成原版：下半张脸 ===
     mouth_region_y = int(y + h * 0.55)
     mouth_region_h = int(h * 0.45)
-    mouth_region = gray[mouth_region_y : mouth_region_y + mouth_region_h, x : x + w]
+    mouth_region = gray[mouth_region_y: mouth_region_y + mouth_region_h, x: x + w]
     if mouth_region.size == 0:
         return None
 
-    # Detect “smile” in candidate region as a proxy for mouth
+    # mouth / smile 检测
     mouths = mouth_cascade.detectMultiScale(
         mouth_region,
         scaleFactor=1.1,
@@ -124,47 +208,33 @@ def extract_mouth_roi_from_frame(
     )
 
     if len(mouths) > 0:
-        # Select the largest mouth box
         areas = [(mw * mh, (mx, my, mw, mh)) for (mx, my, mw, mh) in mouths]
         areas.sort(key=lambda t: t[0], reverse=True)
         _, (mx, my, mw, mh) = areas[0]
-
-        # ===== 放大 + 正方形 + 轻微上移 =====
-        scale = 1.15  # 轻度放大，1.3~1.5 都可以试
-
-        cx = mx + mw / 2.0
-        cy = my + mh / 2.0
-
-        # 取较大的边做正方形，保证嘴巴居中
-        side = int(max(mw, mh) * scale)
-
-        # 轻微往上移一点，让嘴巴偏上，中间留更多下巴空间
-        shift_up = int(0.1 * side)
-        cy = cy - shift_up
-
-        x0 = int(cx - side / 2.0)
-        y0 = int(cy - side / 2.0)
-        x1 = int(cx + side / 2.0)
-        y1 = int(cy + side / 2.0)
-
-        # 边界裁剪，防止越界
-        x0 = max(0, x0)
-        y0 = max(0, y0)
-        x1 = min(mouth_region.shape[1], x1)
-        y1 = min(mouth_region.shape[0], y1)
-
-        mouth_roi = mouth_region[y0:y1, x0:x1]
+        mouth_roi = mouth_region[my: my + mh, mx: mx + mw]
     else:
-        # Fallback: use entire mouth_region to keep temporal continuity
+        # 检不到就用整块 mouth_region
         mouth_roi = mouth_region
 
     if mouth_roi.size == 0:
         return None
 
-    # Size normalization
+    # === 2. 轻微裁剪上下：去一点鼻子、砍掉一部分下巴 ===
+    h_roi, w_roi = mouth_roi.shape
+
+    top_cut_ratio = 0.05   # 上面切掉 5%
+    bottom_keep_ratio = 0.80  # 只保留前 80%，等于砍掉最下面 20%
+
+    top = int(h_roi * top_cut_ratio)
+    bottom = int(h_roi * bottom_keep_ratio)
+
+    if bottom - top >= 10:
+        mouth_roi = mouth_roi[top:bottom, :]
+
+    # 统一尺寸
     mouth_roi = cv.resize(mouth_roi, target_size, interpolation=cv.INTER_AREA)
 
-    # Normalize to [0,1] for downstream DCT / PCA (visual-speech-features-lab.pdf)
+    # 归一化
     mouth_roi = mouth_roi.astype(np.float32) / 255.0
     return mouth_roi
 
@@ -210,6 +280,7 @@ def process_single_video(
         if frame_idx % every_nth != 0:
             frame_idx += 1
             continue
+
         roi = extract_mouth_roi_from_frame(
             frame, face_cascade, mouth_cascade, target_size=target_size
         )
@@ -248,7 +319,7 @@ def process_single_video(
     out_path = out_dir / f"{video_path.stem}_roi.npy"
     np.save(out_path, rois)
 
-    # print(f"[INFO] Saved ROI sequence: {out_path}  shape={rois.shape}")
+    print(f"[INFO] Saved ROI sequence: {out_path}  shape={rois.shape}")
 
 
 # ----------------- Batch process all .mov under short_videos -----------------
@@ -278,14 +349,14 @@ def process_all_videos(debug: bool = False):
 
     print(f"[INFO] Found {len(video_files)} video files.")
 
-    for vp in tqdm(video_files):
-        # print(f"[INFO] Processing: {vp}")
+    for vp in video_files:
+        print(f"[INFO] Processing: {vp}")
         process_single_video(
             video_path=vp,
             out_dir=out_root,
             face_cascade=face_cascade,
             mouth_cascade=mouth_cascade,
-            every_nth=1,  # Adjust if needed
+            every_nth=1,   # Adjust if needed
             max_frames=80,  # Max 80 frames per video
             target_size=(64, 64),
             debug=debug,
@@ -294,4 +365,5 @@ def process_all_videos(debug: bool = False):
 
 if __name__ == "__main__":
     # Debug flag to inspect whether mouth ROI is correct
-    process_all_videos(debug=True)
+    process_all_videos(debug=False)
+
