@@ -1,351 +1,348 @@
 """
-Audio-Visual feature extraction (no CLI args by default).
+Audio-Visual feature extraction.
 
-- Extract audio MFCC(+Δ+ΔΔ) from wav
-- Extract from mouth ROI sequences (*.npy):
-    * Shape-based features (mouth height / width)
-    * Image-based appearance features (low-frequency 2D DCT)
-    * PCA appearance features (Eigenlips)
-    * Hybrid features (shape + DCT)
-- Audio and Visual are paired via file name prefix (<base_id>.wav ↔ <base_id>_roi.npy)
+Inputs
+------
+- ROI sequences: ROOT/roi_npy/<base_id>_roi.npy, shape (T, H, W), float32 in [0,1]
+- WAV audio:     ROOT/wav/<base_id>.wav
+
+Outputs
+-------
+ROOT/
+  audio_feats/
+    mfcc/<base_id>_mfcc.npy            (Fa, Ta) == (D_a, TARGET_T)
+  visual_feats/
+    shape/<base_id>_shape.npy          (Tv, 2)          -> [mouth_h_norm, mouth_w_norm]
+    dct/<base_id>_dct.npy              (Tv, Kdct)
+    pca/<base_id>_pca.npy              (Tv_fix, Kpca)   -> (TARGET_T, Kpca)
+    hybrid/<base_id>_hybrid.npy        (Tv, 2 + Kdct)
 """
+from __future__ import annotations
 
+import math
 from pathlib import Path
+from typing import List, Tuple
 
-import cv2 as cv
-import librosa
 import numpy as np
-from joblib import dump, load
-from skimage.filters import threshold_otsu
-from skimage.measure import label, regionprops
-from sklearn.decomposition import PCA
 
-# ===================== Path configuration =====================
+# Optional deps (guarded imports so the file can be imported without them)
+try:
+    import cv2 as cv
+except Exception as _:
+    cv = None
+try:
+    import librosa
+except Exception as _:
+    librosa = None
+try:
+    from sklearn.decomposition import PCA
+except Exception as _:
+    PCA = None
 
 ROOT_DIR = Path(__file__).resolve().parent
 
+# Unified time length (must be aligned with av_model_training.py TARGET_T)
+TARGET_T = 40
+
 # Inputs
 ROI_DIR = ROOT_DIR / "roi_npy"  # Output from video_mouth_roi_extractor.py
-WAV_DIR = ROOT_DIR / "wav"      # Output from mov_to_wav_batch.py
+WAV_DIR = ROOT_DIR / "wav"      # Directory of wav files
 
-# Top-level output directories
+# Outputs
 AUDIO_OUT_DIR = ROOT_DIR / "audio_feats"
 VISUAL_OUT_DIR = ROOT_DIR / "visual_feats"
 
-# Audio subdirectories
 AUDIO_MFCC_DIR = AUDIO_OUT_DIR / "mfcc"
 
-# Visual subdirectories
 VISUAL_SHAPE_DIR = VISUAL_OUT_DIR / "shape"
-VISUAL_DCT_DIR = VISUAL_OUT_DIR / "dct"
-VISUAL_PCA_DIR = VISUAL_OUT_DIR / "pca"
-VISUAL_HYBRID_DIR = VISUAL_OUT_DIR / "hybrid"
+VISUAL_DCT_DIR   = VISUAL_OUT_DIR / "dct"
+VISUAL_PCA_DIR   = VISUAL_OUT_DIR / "pca"
+VISUAL_HYBRID_DIR= VISUAL_OUT_DIR / "hybrid"
 
-# PCA model
-MODELS_DIR = ROOT_DIR / "models"
-PCA_MODEL_PATH = MODELS_DIR / "pca_eigenlips.joblib"
+# ------------------------- Utils -------------------------
+def ensure_dirs():
+    for d in [AUDIO_MFCC_DIR, VISUAL_SHAPE_DIR, VISUAL_DCT_DIR, VISUAL_PCA_DIR, VISUAL_HYBRID_DIR]:
+        d.mkdir(parents=True, exist_ok=True)
 
-# DCT & PCA dimensions
-N_DCT_COEFFS = 40
-N_PCA_COMPONENTS = 30
+def list_base_ids() -> List[str]:
+    """Return sorted list of base_ids derived from ROI files."""
+    roi_files = sorted(ROI_DIR.glob("*_roi.npy"))
+    ids = [p.name[:-8] for p in roi_files]  # strip "_roi.npy"
+    return ids
 
+def zscore_time(x: np.ndarray, eps: float = 1e-6) -> np.ndarray:
+    """Per-dimension z-score over time axis 0."""
+    m = x.mean(axis=0, keepdims=True)
+    s = x.std(axis=0, keepdims=True)
+    return (x - m) / (s + eps)
 
-# ===================== Audio features: MFCC (librosa) =====================
+def pad_or_crop_time_T_first(seq: np.ndarray, target_T: int) -> np.ndarray:
+    """
+    Align along the time dimension for (T, D) shaped sequences.
 
+    Input:  shape=(T, D)
+    Output: shape=(target_T, D)
+    """
+    if seq.ndim != 2:
+        raise ValueError(f"expect (T, D), got {seq.shape}")
 
-def extract_audio_mfcc_librosa(
+    T, D = seq.shape
+
+    if T == target_T:
+        return seq
+
+    if T > target_T:
+        start = (T - target_T) // 2
+        end = start + target_T
+        return seq[start:end, :]
+
+    pad_len = target_T - T
+    pad = np.zeros((pad_len, D), dtype=seq.dtype)
+    return np.vstack([seq, pad])
+
+def zigzag_indices(n: int):
+    """Generate zigzag scan order for an n x n block."""
+    idx = []
+    for s in range(2*n - 1):
+        if s % 2 == 0:
+            r = min(s, n-1)
+            c = s - r
+            while r >= 0 and c < n:
+                idx.append((r, c))
+                r -= 1
+                c += 1
+        else:
+            c = min(s, n-1)
+            r = s - c
+            while c >= 0 and r < n:
+                idx.append((r, c))
+                r += 1
+                c -= 1
+    return idx
+
+_ZZ_CACHE = {}
+def zigzag_flatten(block: np.ndarray, k: int) -> np.ndarray:
+    """Return first k coefficients of the zigzag scan of block (n x n)."""
+    n = block.shape[0]
+    order = _ZZ_CACHE.get(n)
+    if order is None:
+        order = zigzag_indices(n)
+        _ZZ_CACHE[n] = order
+    flat = []
+    for (r,c) in order[:k]:
+        flat.append(block[r, c])
+    return np.asarray(flat, dtype=np.float32)
+
+# ------------------------- Audio -------------------------
+def extract_mfcc(
     wav_path: Path,
-    sr_target: int = 16000,
+    sr: int = 16000,
     n_mfcc: int = 13,
-    win_ms: float = 25.0,
-    hop_ms: float = 10.0,
+    target_T: int = TARGET_T,
 ) -> np.ndarray:
     """
-    Extract MFCC + Δ + ΔΔ with librosa, output shape: (D, T).
+    提取 MFCC + Δ + ΔΔ，并统一到固定时长，最终输出 (D_a, target_T)。
+
+    - 原始 librosa: (T, n_mfcc)
+    - 拼接 Δ/ΔΔ 后: (T, 3*n_mfcc)
+    - 时间 z-score + pad/crop: (target_T, 3*n_mfcc)
+    - 转置保存: (3*n_mfcc, target_T)
     """
-    y, sr = librosa.load(str(wav_path), sr=sr_target)
-    if np.max(np.abs(y)) > 0:
-        y = y / np.max(np.abs(y))
+    assert librosa is not None, "librosa is required for audio features"
+    y, _sr = librosa.load(wav_path.as_posix(), sr=sr)
 
-    n_fft = int(sr * win_ms / 1000.0)
-    hop_length = int(sr * hop_ms / 1000.0)
+    mfcc = librosa.feature.mfcc(y=y, sr=sr, n_mfcc=n_mfcc).T  # (T, n_mfcc)
+    # Delta + Delta-Delta
+    d1 = librosa.feature.delta(mfcc, order=1)
+    d2 = librosa.feature.delta(mfcc, order=2)
+    feat = np.concatenate([mfcc, d1, d2], axis=1).astype(np.float32)  # (T, 3*n_mfcc)
 
-    # MFCC (including 0th cepstral)
-    mfcc = librosa.feature.mfcc(
-        y=y,
-        sr=sr,
-        n_mfcc=n_mfcc,
-        n_fft=n_fft,
-        hop_length=hop_length,
-    )  # (n_mfcc, T)
+    # z-score over time for stability
+    feat = zscore_time(feat)  # (T, 3*n_mfcc)
 
-    # First- and second-order deltas
-    delta = librosa.feature.delta(mfcc, order=1)
-    delta_delta = librosa.feature.delta(mfcc, order=2)
+    # unify time length
+    feat = pad_or_crop_time_T_first(feat, target_T=target_T)  # (target_T, 3*n_mfcc)
 
-    feats = np.vstack([mfcc, delta, delta_delta]).astype(np.float32)  # (3*n_mfcc, T)
+    # transpose to (D_a, T_a) expected by av_model_training.py
+    feat = feat.T.astype(np.float32)  # (3*n_mfcc, target_T)
+
+    return feat
+
+# ------------------------- Visual -------------------------
+def _mouth_hw_from_roi(roi: np.ndarray, thr_method: str = "otsu") -> Tuple[float, float]:
+    """
+    Estimate mouth opening height/width from a grayscale ROI in [0,1].
+    Heuristic: threshold the dark interior and take the bbox of the largest blob.
+    Fallback to zeros if nothing found.
+    """
+    if cv is None:
+        # Fallback: no cv2, use simple threshold
+        m = roi < 0.4
+    else:
+        roi8 = np.clip(roi * 255.0, 0, 255).astype(np.uint8)
+        if thr_method == "otsu":
+            _, m = cv.threshold(roi8, 0, 255, cv.THRESH_BINARY_INV + cv.THRESH_OTSU)
+        else:
+            _, m = cv.threshold(roi8, 0, 255, cv.THRESH_BINARY_INV + cv.THRESH_TRIANGLE)
+        m = m.astype(bool)
+    if not m.any():
+        return 0.0, 0.0
+    # largest connected component
+    if cv is not None:
+        n, labels = cv.connectedComponents(m.astype(np.uint8))
+        if n > 1:
+            sizes = [(labels == i).sum() for i in range(1, n)]
+            i_star = 1 + int(np.argmax(sizes))
+            mask = labels == i_star
+        else:
+            mask = m
+    else:
+        mask = m
+    ys, xs = np.where(mask)
+    h = (ys.max() - ys.min() + 1) / roi.shape[0]
+    w = (xs.max() - xs.min() + 1) / roi.shape[1]
+    return float(h), float(w)
+
+def extract_shape_features(roi_seq: np.ndarray) -> np.ndarray:
+    """(T,H,W)->(T,2) normalized mouth height/width, values roughly in [0,1]."""
+    T = roi_seq.shape[0]
+    out = np.zeros((T, 2), dtype=np.float32)
+    for t in range(T):
+        h, w = _mouth_hw_from_roi(roi_seq[t])
+        out[t, 0] = h
+        out[t, 1] = w
+    return out
+
+def extract_dct_features(roi_seq: np.ndarray, block_size: int = 32, k: int = 40) -> np.ndarray:
+    """
+    For each frame, compute 2D DCT of a resized square block and keep first k coeffs via zig-zag.
+    Input ROI assumed to be in [0,1].
+    """
+    assert cv is not None, "opencv-python is required for visual DCT features"
+    T = roi_seq.shape[0]
+    feats = np.zeros((T, k), dtype=np.float32)
+    for t in range(T):
+        frame = roi_seq[t]
+        if frame.shape[0] != block_size or frame.shape[1] != block_size:
+            frame = cv.resize(frame, (block_size, block_size), interpolation=cv.INTER_AREA)
+        block = np.float32(frame)
+        dct = cv.dct(block)  # 2D DCT
+        # take low-frequency coefficients from top-left via zig-zag
+        feats[t] = zigzag_flatten(dct, k)
+    # log-magnitude compress (except DC term)
+    feats[:, 1:] = np.sign(feats[:, 1:]) * np.log1p(np.abs(feats[:, 1:]))
+    # per-dimension z-score over time
+    feats = zscore_time(feats)
     return feats
 
-
-# ===================== Visual shape features: mouth height / width =====================
-
-
-def mouth_shape_features(roi_frame: np.ndarray) -> np.ndarray:
-    """
-    Extract shape-based features from a single mouth ROI frame: height, width.
-
-    Input:
-        roi_frame: (H, W) float32, recommended normalized to [0,1]
-    Output:
-        np.array([height, width], dtype=float32)
-    """
-    # Convert to uint8 for Otsu threshold
-    roi_uint8 = (roi_frame * 255).astype(np.uint8)
-
-    try:
-        thr = threshold_otsu(roi_uint8)
-        binary = roi_uint8 > thr
-    except Exception:
-        # Fallback to fixed threshold if Otsu fails
-        binary = roi_uint8 > 30
-
-    lbl = label(binary)
-    regions = regionprops(lbl)
-
-    if not regions:
-        return np.array([0.0, 0.0], dtype=np.float32)
-
-    # Take the largest connected component as the lip region
-    region = max(regions, key=lambda r: r.area)
-    minr, minc, maxr, maxc = region.bbox
-    height = float(maxr - minr)
-    width = float(maxc - minc)
-
-    return np.array([height, width], dtype=np.float32)
-
-
-# ===================== Visual appearance features: low-frequency 2D DCT =====================
-
-
-def dct_lowfreq_features(
-    roi_frame: np.ndarray, num_coeff: int = N_DCT_COEFFS
+def extract_pca_features(
+    roi_seq: np.ndarray,
+    k: int = 50,
+    target_T: int = TARGET_T,
 ) -> np.ndarray:
     """
-    Apply 2D DCT on a single ROI frame and take the first num_coeff coefficients
-    in diagonal (zig-zag) order.
+    PCA over flattened frames within the clip (unsupervised, per-clip).
 
-    Returns:
-        A 1D vector of shape (num_coeff,)
+    目标:
+    - 所有样本输出统一 shape = (TARGET_T, k)
+
+    步骤:
+    1) PCA 得到 (T, n_comp) 其中 n_comp <= min(k, H*W, T)
+    2) 若 n_comp < k, 在特征维度补零; 若 n_comp > k, 截断到 k
+    3) 时间维 z-score
+    4) 时间轴 pad/crop 到 TARGET_T
     """
-    # cv.dct requires float32
-    img = roi_frame.astype(np.float32)
-    dct_mat = cv.dct(img)  # 2D DCT, shape=(H, W)
+    assert PCA is not None, "scikit-learn is required for PCA features"
+    T, H, W = roi_seq.shape
+    X = roi_seq.reshape(T, H * W)
 
-    h, w = dct_mat.shape
-    coeffs: list[float] = []
+    n_comp = min(k, H * W, T)
+    pca = PCA(n_components=n_comp)
+    Xp = pca.fit_transform(X).astype(np.float32)  # (T, n_comp)
 
-    # Simple zig-zag: walk along diagonals starting at (0, 0)
-    for s in range(h + w - 1):
-        for i in range(s + 1):
-            j = s - i
-            if i < h and j < w:
-                coeffs.append(float(dct_mat[i, j]))
-                if len(coeffs) >= num_coeff:
-                    return np.array(coeffs, dtype=np.float32)
+    # unify feature dimension to k
+    cur_k = Xp.shape[1]
+    if cur_k < k:
+        pad = np.zeros((T, k - cur_k), dtype=Xp.dtype)
+        Xp = np.concatenate([Xp, pad], axis=1)
+    elif cur_k > k:
+        Xp = Xp[:, :k]
+    # now (T, k)
 
-    # If ROI is too small, we may have fewer than num_coeff coefficients
-    return np.array(coeffs, dtype=np.float32)
+    Xp = zscore_time(Xp)  # stabilize scale
 
+    # unify time dimension
+    Xp = pad_or_crop_time_T_first(Xp, target_T=target_T)  # (TARGET_T, k)
 
-# ===================== Visual appearance features: PCA (Eigenlips) =====================
+    return Xp
 
+def process_visual_single(base_id: str, save_pca: bool = True, k_dct: int = 40, k_pca: int = 50):
+    roi_path = ROI_DIR / f"{base_id}_roi.npy"
+    if not roi_path.exists():
+        print(f"[WARN] ROI not found for base_id={base_id}")
+        return
+    roi_seq = np.load(roi_path).astype(np.float32)  # (T,H,W) in [0,1]
 
-def fit_pca_on_roi_dir(
-    roi_dir: Path,
-    n_components: int = N_PCA_COMPONENTS,
-    pca_model_path: Path | None = None,
-) -> PCA:
-    """
-    Fit PCA on the entire ROI directory for image-based appearance PCA features.
+    # Features
+    shape = extract_shape_features(roi_seq)                        # (T,2)
+    dct   = extract_dct_features(roi_seq, block_size=32, k=k_dct) # (T,k_dct)
+    if save_pca:
+        pca = extract_pca_features(roi_seq, k=k_pca)              # (TARGET_T,k_pca)
+    else:
+        pca = None
 
-    Each .npy file in roi_dir is expected to be:
-        <base_id>_roi.npy, shape=(T, H, W)
-    """
-    roi_files = sorted(roi_dir.glob("*_roi.npy"))
-    if not roi_files:
-        raise RuntimeError(f"No *_roi.npy files found in {roi_dir}")
+    # Hybrid (shape + DCT). Shapes already normalized; dct z-scored.
+    hybrid = np.concatenate([shape, dct], axis=1).astype(np.float32)
 
-    all_flat: list[np.ndarray] = []
+    # Persist
+    np.save(VISUAL_SHAPE_DIR / f"{base_id}_shape.npy", shape.astype(np.float32))
+    np.save(VISUAL_DCT_DIR   / f"{base_id}_dct.npy",   dct.astype(np.float32))
+    if pca is not None:
+        np.save(VISUAL_PCA_DIR   / f"{base_id}_pca.npy",   pca.astype(np.float32))
+    np.save(VISUAL_HYBRID_DIR/ f"{base_id}_hybrid.npy", hybrid.astype(np.float32))
 
-    for roi_path in roi_files:
-        roi_seq = np.load(roi_path)
-        if roi_seq.ndim != 3:
-            continue
-        T, H, W = roi_seq.shape
-        flat = roi_seq.reshape(T, H * W)  # (T, H*W)
-        all_flat.append(flat)
-
-    if not all_flat:
-        raise RuntimeError(f"No valid ROI sequences found in {roi_dir}")
-
-    X = np.vstack(all_flat).astype(np.float32)  # (N_frames_total, H*W)
-
-    n_components_eff = min(n_components, X.shape[0], X.shape[1])
-    pca = PCA(n_components=n_components_eff, whiten=False, svd_solver="randomized")
-    pca.fit(X)
-
-    if pca_model_path is not None:
-        pca_model_path.parent.mkdir(parents=True, exist_ok=True)
-        dump(pca, str(pca_model_path))
-        print(f"[INFO] PCA model saved to {pca_model_path}")
-
-    return pca
-
-
-def load_pca(pca_model_path: Path) -> PCA:
-    """Load a previously fitted PCA model."""
-    return load(str(pca_model_path))
-
-
-# ===================== Main pipeline: align audio / visual file names and output features =====================
-
-
-def process_av_features_default() -> None:
-    """
-    Inputs:
-    - Under ROI_DIR: <base_id>_roi.npy
-    - Under WAV_DIR: <base_id>.wav
-
-    Outputs:
-    - audio_feats/mfcc/:
-        <base_id>_audio_mfcc.npy shape=(D_a, T_a)
-    - visual_feats/shape/:
-        <base_id>_shape.npy   shape=(T_v, 2)
-    - visual_feats/dct/:
-        <base_id>_dct.npy     shape=(T_v, N_DCT_COEFFS)
-    - visual_feats/pca/:
-        <base_id>_pca.npy     shape=(T_v, n_pca_eff)
-    - visual_feats/hybrid/:
-        <base_id>_hybrid.npy  shape=(T_v, 2+N_DCT_COEFFS)
-    """
-    # Directory mapping
-    roi_dir = ROI_DIR
-    wav_dir = WAV_DIR
-
-    audio_mfcc_dir = AUDIO_MFCC_DIR
-
-    visual_shape_dir = VISUAL_SHAPE_DIR
-    visual_dct_dir = VISUAL_DCT_DIR
-    visual_pca_dir = VISUAL_PCA_DIR
-    visual_hybrid_dir = VISUAL_HYBRID_DIR
-
-    pca_model_path = PCA_MODEL_PATH
-
-    # Ensure input / output directories exist
-    wav_dir.mkdir(exist_ok=True)
-    roi_dir.mkdir(exist_ok=True)
-
-    MODELS_DIR.mkdir(parents=True, exist_ok=True)
-    AUDIO_OUT_DIR.mkdir(parents=True, exist_ok=True)
-    VISUAL_OUT_DIR.mkdir(parents=True, exist_ok=True)
-
-    audio_mfcc_dir.mkdir(parents=True, exist_ok=True)
-    visual_shape_dir.mkdir(parents=True, exist_ok=True)
-    visual_dct_dir.mkdir(parents=True, exist_ok=True)
-    visual_pca_dir.mkdir(parents=True, exist_ok=True)
-    visual_hybrid_dir.mkdir(parents=True, exist_ok=True)
-
-    print(f"[INFO] ROI_DIR        = {roi_dir}")
-    print(f"[INFO] WAV_DIR        = {wav_dir}")
-    print(f"[INFO] AUDIO_MFCC_OUT = {audio_mfcc_dir}")
-    print(f"[INFO] VISUAL_SHAPE   = {visual_shape_dir}")
-    print(f"[INFO] VISUAL_DCT     = {visual_dct_dir}")
-    print(f"[INFO] VISUAL_PCA     = {visual_pca_dir}")
-    print(f"[INFO] VISUAL_HYBRID  = {visual_hybrid_dir}")
-    print(f"[INFO] PCA_MODEL      = {pca_model_path}")
-
-    # 1) Fit PCA (Eigenlips) on all ROIs
-    pca = fit_pca_on_roi_dir(
-        roi_dir=roi_dir,
-        n_components=N_PCA_COMPONENTS,
-        pca_model_path=pca_model_path,
+    print(
+        f"[OK] {base_id}: shape={shape.shape}, dct={dct.shape}, "
+        f"pca={(pca.shape if pca is not None else None)}, hybrid={hybrid.shape}"
     )
 
-    # 2) Process each base_id
-    roi_files = sorted(roi_dir.glob("*_roi.npy"))
-    if not roi_files:
-        print(f"[WARN] No *_roi.npy in {roi_dir}")
+# ------------------------- Orchestrators -------------------------
+def process_audio_default():
+    wavs = sorted(WAV_DIR.glob("*.wav"))
+    if not wavs:
+        print(f"[WARN] No wav files under {WAV_DIR}")
         return
-
-    for roi_path in roi_files:
-        base_id = roi_path.stem.replace("_roi", "")  # e.g. xxx_roi → xxx
-        wav_path = wav_dir / f"{base_id}.wav"
-
-        # ========== Audio features ==========
-        if not wav_path.exists():
-            print(f"[WARN] Missing audio file for {base_id}: {wav_path}")
-        else:
-            audio_feats = extract_audio_mfcc_librosa(wav_path)
-            audio_out_path = audio_mfcc_dir / f"{base_id}_audio_mfcc.npy"
-            np.save(audio_out_path, audio_feats.astype(np.float32))
-            print(
-                f"[INFO] Saved audio MFCC: {audio_out_path}, shape={audio_feats.shape}"
-            )
-
-        # ========== Visual features ==========
-        roi_seq = np.load(roi_path)  # (T, H, W)
-        if roi_seq.ndim != 3:
-            print(f"[WARN] ROI has wrong shape: {roi_path}, shape={roi_seq.shape}")
+    for wp in wavs:
+        base_id = wp.stem
+        outp = AUDIO_MFCC_DIR / f"{base_id}_mfcc.npy"
+        if outp.exists():
             continue
+        try:
+            feat = extract_mfcc(wp)  # (D_a, TARGET_T)
+            np.save(outp, feat.astype(np.float32))
+            print(f"[OK] {base_id}: mfcc={feat.shape}")
+        except Exception as e:
+            print(f"[ERR] MFCC failed for {wp}: {e}")
 
-        T, H, W = roi_seq.shape
+def process_visual_default(save_pca: bool = True):
+    base_ids = list_base_ids()
+    if not base_ids:
+        print(f"[WARN] No ROI files under {ROI_DIR}")
+        return
+    for base_id in base_ids:
+        try:
+            process_visual_single(base_id, save_pca=save_pca)
+        except Exception as e:
+            print(f"[ERR] Visual feature failed for {base_id}: {e}")
 
-        shape_list: list[np.ndarray] = []
-        dct_list: list[np.ndarray] = []
+def process_av_features_default():
+    ensure_dirs()
+    process_audio_default()
+    process_visual_default(save_pca=True)
 
-        # Extract shape / DCT per frame
-        for t in range(T):
-            frame = roi_seq[t, :, :].astype(np.float32)  # (H, W)
-
-            # Simple safeguard: if not in [0,1], normalize
-            max_val = float(np.max(frame))
-            if max_val > 0:
-                frame_norm = frame / max_val
-            else:
-                frame_norm = frame
-
-            shape_feat = mouth_shape_features(frame_norm)
-            dct_feat = dct_lowfreq_features(frame_norm, num_coeff=N_DCT_COEFFS)
-            shape_list.append(shape_feat)
-            dct_list.append(dct_feat)
-
-        shape_arr = np.stack(shape_list, axis=0).astype(np.float32)  # (T, 2)
-        dct_arr = np.stack(dct_list, axis=0).astype(np.float32)      # (T, N_DCT_COEFFS)
-
-        # PCA appearance: flatten each frame and transform
-        flat = roi_seq.reshape(T, H * W).astype(np.float32)          # (T, H*W)
-        pca_arr = pca.transform(flat).astype(np.float32)             # (T, n_pca_eff)
-
-        # Hybrid: shape + DCT
-        hybrid_arr = np.concatenate(
-            [shape_arr, dct_arr], axis=1
-        )  # (T, 2 + N_DCT_COEFFS)
-
-        # Persist per subdirectory
-        np.save(visual_shape_dir / f"{base_id}_shape.npy", shape_arr)
-        np.save(visual_dct_dir / f"{base_id}_dct.npy", dct_arr)
-        np.save(visual_pca_dir / f"{base_id}_pca.npy", pca_arr)
-        np.save(visual_hybrid_dir / f"{base_id}_hybrid.npy", hybrid_arr)
-
-        print(
-            f"[INFO] {base_id}: shape={shape_arr.shape}, "
-            f"dct={dct_arr.shape}, pca={pca_arr.shape}, hybrid={hybrid_arr.shape}"
-        )
-
-
+# ------------------------- CLI -------------------------
 def main():
     process_av_features_default()
-
 
 if __name__ == "__main__":
     main()
