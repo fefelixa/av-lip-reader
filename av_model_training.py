@@ -27,32 +27,17 @@ from typing import List, Tuple
 
 import numpy as np
 from sklearn.model_selection import train_test_split
-
-try:
-    from tensorflow.keras.callbacks import EarlyStopping, ModelCheckpoint
-    from tensorflow.keras.layers import (
-        Conv2D,
-        Dense,
-        Dropout,
-        Flatten,
-        InputLayer,
-        MaxPooling2D,
-    )
-    from tensorflow.keras.models import Sequential
-    from tensorflow.keras.utils import to_categorical
-except:
-    import tensorflow as tf
-
-    EarlyStopping = tf.keras.callbacks.EarlyStopping
-    ModelCheckpoint = tf.keras.callbacks.ModelCheckpoint
-    Conv2D = tf.keras.layers.Conv2D
-    Dense = tf.keras.layers.Dense
-    Dropout = tf.keras.layers.Dropout
-    Flatten = tf.keras.layers.Flatten
-    InputLayer = tf.keras.layers.InputLayer
-    MaxPooling2D = tf.keras.layers.MaxPooling2D
-    Sequential = tf.keras.models.Sequential
-    to_categorical = tf.keras.utils.to_categorical
+from tensorflow.keras.callbacks import EarlyStopping, ModelCheckpoint
+from tensorflow.keras.layers import (
+    Conv2D,
+    Dense,
+    Dropout,
+    Flatten,
+    InputLayer,
+    MaxPooling2D,
+)
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.utils import to_categorical
 
 # ===================== Paths and configuration =====================
 
@@ -64,11 +49,10 @@ VISUAL_HYBRID_DIR = ROOT_DIR / "visual_feats" / "hybrid"
 
 NAMES_FILE = ROOT_DIR / "NAMES.txt"
 
-AV_MODEL_OUT = ROOT_DIR / "models" / "visual_cnn_hybrid.keras"
+AV_MODEL_OUT = ROOT_DIR / "models" / "visual_cnn_hybrid.h5"
 AV_MODEL_OUT.parent.mkdir(parents=True, exist_ok=True)
 
-# Unified number of time frames; aligned with visual-only for comparability
-TARGET_T = 40
+TARGET_T = 40  # Unified number of time frames; aligned with visual-only for comparability
 RANDOM_STATE = 0
 TEST_VAL_RATIO = 0.2  # 80/10/10
 
@@ -174,19 +158,21 @@ def load_av_dataset(
     visual_dir = Path(visual_feat_dir)
 
     names = load_names(names_file)
-    label_to_idx = {name.strip().lower(): idx for idx, name in enumerate(names)}
+    label_to_idx = {name: idx for idx, name in enumerate(names)}
 
     X_list: list[np.ndarray] = []
     y_list: list[int] = []
 
-    audio_files = sorted(audio_dir.glob("*_audio_mfcc.npy"))
+    audio_files = sorted(audio_dir.glob("*_mfcc.npy"))
     if not audio_files:
-        raise RuntimeError(f"No *_audio_mfcc.npy found in {audio_dir}")
+        raise RuntimeError(f"No *_mfcc.npy found in {audio_dir}")
 
     for audio_path in audio_files:
-        stem = audio_path.stem  # <base_id>_audio_mfcc
-        base_id = stem.replace("_audio_mfcc", "")
-        label_name = base_id.split("_")[0][:-3] # remove numbers from filename
+        stem = audio_path.stem  # <base_id>_mfcc
+        base_id = stem.replace("_mfcc", "")
+        # 先把名字里的字母取出来，再首字母大写，对齐 NAMES.txt 里的写法
+        raw_label = "".join(ch for ch in base_id if ch.isalpha())
+        label_name = raw_label.capitalize()
 
         if label_name not in label_to_idx:
             print(f"[WARN] label {label_name} not in NAMES.txt, skip {audio_path}")
@@ -315,7 +301,7 @@ def main() -> None:
         X_train,
         y_train,
         validation_data=(X_val, y_val),
-        epochs=50,
+        epochs=100,
         batch_size=32,
         callbacks=callbacks,
         verbose=1,
@@ -323,7 +309,7 @@ def main() -> None:
 
     print("[INFO] Evaluate on test set...")
     test_loss, test_acc = model.evaluate(X_test, y_test, verbose=0)
-    print(f"[RESULT] AV test accuracy = {100.0*test_acc:.2f}%, loss = {test_loss:.4f}")
+    print(f"[RESULT] AV test accuracy = {test_acc:.4f}, loss = {test_loss:.4f}")
 
 
 if __name__ == "__main__":
